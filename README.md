@@ -1,9 +1,7 @@
 # Dyulon Systems — Full Technical Context Document
 
-### For AI assistants continuing this project
-
 **Version:** Rev 3 | **Last updated:** June 2026  
-**Team:** Tanush Gupta, Jishnu Mehra, Divye Yadav — TU Delft Impact Contest (Ideation category)
+**Team:** Tanush Gupta, Jishnu Mehra, Divye Yadav
 
 ---
 
