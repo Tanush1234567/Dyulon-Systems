@@ -294,3 +294,98 @@ fprintf('Front: x=%.2f m, y=±%.3f m  (%.0f%% semi-span)\n', ...
 fprintf('Rear:  x=%.2f m, y=±%.3f m  (%.0f%% semi-span)\n', ...
         p.x_rear,  abs(p.r_motor(3,2)), p.y_rear_frac*100);
 fprintf('=============================================\n\n');
+
+
+%% =========================================================================
+%  15. STATE VECTOR DEFINITION
+%  Order here must match the Mux block in Simulink exactly.
+%  This vector serves two purposes:
+%    (a) defines the interface contract between all blocks
+%    (b) provides initial conditions for the 6DOF block
+%% =========================================================================
+
+% --- Hover initial conditions ---
+ic.V_air          = 0;
+ic.alpha          = 0;
+ic.beta_side      = 0;
+ic.p_rate         = 0;
+ic.q_rate         = 0;
+ic.r_rate         = 0;
+ic.phi            = 0;
+ic.theta          = 0;
+ic.psi            = 0;
+ic.pos_N          = 0;
+ic.pos_E          = 0;
+ic.pos_D          = -10;     % 10 m altitude, NED so negative
+ic.vel_N          = 0;
+ic.vel_E          = 0;
+ic.vel_D          = 0;
+ic.beta_tilt_FL   = 0;
+ic.beta_tilt_FR   = 0;
+ic.Omega_FL       = p.Omega_hover_front;
+ic.Omega_FR       = p.Omega_hover_front;
+ic.Omega_RL       = p.Omega_hover_rear;
+ic.Omega_RR       = p.Omega_hover_rear;
+
+% --- Pack into flat vector (order is the contract) ---
+%  [1]  V_air       m/s
+%  [2]  alpha       rad
+%  [3]  beta_side   rad
+%  [4]  p_rate      rad/s
+%  [5]  q_rate      rad/s
+%  [6]  r_rate      rad/s
+%  [7]  phi         rad
+%  [8]  theta       rad
+%  [9]  psi         rad
+%  [10] pos_N       m
+%  [11] pos_E       m
+%  [12] pos_D       m
+%  [13] vel_N       m/s
+%  [14] vel_E       m/s
+%  [15] vel_D       m/s
+%  [16] beta_tilt_FL rad
+%  [17] beta_tilt_FR rad
+%  [18] Omega_FL    rad/s
+%  [19] Omega_FR    rad/s
+%  [20] Omega_RL    rad/s
+%  [21] Omega_RR    rad/s
+
+p.state0_vec = [
+    ic.V_air;
+    ic.alpha;
+    ic.beta_side;
+    ic.p_rate;
+    ic.q_rate;
+    ic.r_rate;
+    ic.phi;
+    ic.theta;
+    ic.psi;
+    ic.pos_N;
+    ic.pos_E;
+    ic.pos_D;
+    ic.vel_N;
+    ic.vel_E;
+    ic.vel_D;
+    ic.beta_tilt_FL;
+    ic.beta_tilt_FR;
+    ic.Omega_FL;
+    ic.Omega_FR;
+    ic.Omega_RL;
+    ic.Omega_RR
+];
+
+% --- 6DOF block needs these separately ---
+% Position initial condition (NED)
+p.ic_pos    = [ic.pos_N; ic.pos_E; ic.pos_D];
+
+% Velocity initial condition (body frame for Euler block)
+p.ic_vel    = [ic.V_air; 0; 0];
+
+% Euler angle initial condition
+p.ic_euler  = [ic.phi; ic.theta; ic.psi];
+
+% Body rate initial condition
+p.ic_rates  = [ic.p_rate; ic.q_rate; ic.r_rate];
+
+fprintf('State vector defined: %d elements\n', length(p.state0_vec));
+fprintf('Initial altitude: %.1f m\n', -ic.pos_D);

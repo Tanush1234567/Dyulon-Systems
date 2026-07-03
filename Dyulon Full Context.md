@@ -1,4 +1,4 @@
-# Dyulon Systems — Full Technical Context Document
+    # Dyulon Systems — Full Technical Context Document
 
 ### For AI assistants continuing this project
 
