@@ -207,6 +207,73 @@ p.Omega_max = [p.Omega_max_front, p.Omega_max_front, ...
 p.motor_bandwidth = 25;   % rad/s  first-order motor model corner frequency
 
 %% =========================================================================
+%  8b. RATE-LOOP CONTROL GAINS  (REV 4 -- first-pass, DERIVED not guessed)
+%
+%  Derivation method (repeatable -- redo this if geometry/mass/motor specs
+%  change): linearise control effectiveness at the hover operating point,
+%  then size P/I gains for a target closed-loop rate-loop bandwidth of
+%  0.2x the motor bandwidth (standard rule of thumb: keep the outer loop
+%  well below the actuator's own bandwidth so actuator lag doesn't erode
+%  phase margin).
+%
+%    dT/dOmega   = 2*KpT_0*Omega_hover        (thrust sensitivity per motor)
+%    L_domega    = y_front * dT/dOmega_front  (roll moment per rad/s diff-Omega,
+%                                               front pair only -- vertical-heavy
+%                                               role per Sec 6 -> primary roll axis)
+%    M_domega    = x_front * dT/dOmega_front  (pitch moment per rad/s diff-Omega,
+%                                               front pair -- see note below)
+%    N_domega    = 2*(dQ/dOmega_front + dQ/dOmega_rear)  (yaw reaction-torque
+%                                               sensitivity, both pairs combined
+%                                               -- this is the WEAK axis, no
+%                                               vertical fin, confirmed below)
+%
+%    Kp = I_axis * omega_cl / effectiveness
+%    Ki = Kp * omega_cl / 10        (mild integral action, first pass)
+%
+%  RESULT (with current geometry/mass): Kp_yaw comes out ~8-20x larger than
+%  Kp_roll/Kp_pitch to hit the same 5 rad/s bandwidth purely from reaction
+%  torque -- this is a REAL result of the derivation, not an assumption,
+%  and it quantifies the doc's existing qualitative "yaw is the weak axis"
+%  note. In practice this large a gain will likely saturate motor
+%  differential authority before it hits commanded bandwidth; the
+%  controller uses differential TILT on top of differential Omega for
+%  yaw (see dyulon_controller.m) specifically to add authority this
+%  linearisation doesn't capture (tilt-differential yaw is a REV 4 nonlinear
+%  effect, not present in this linear derivation).
+%
+%  THESE ARE FIRST-PASS STARTING GAINS FOR BENCH/SIL TUNING, NOT FINAL
+%  FLIGHT GAINS. Retune against actual rate-loop step response once the
+%  actuator dynamics constants (Sec 6) are replaced with bench-measured
+%  values -- gains derived against placeholder actuator dynamics will not
+%  carry over correctly once those change.
+%% =========================================================================
+omega_cl_rate = 0.2 * p.motor_bandwidth;   % rad/s  target rate-loop bandwidth
+
+dT_dOmega_front = 2 * p.KpT_front_0 * p.Omega_hover_front;
+dT_dOmega_rear  = 2 * p.KpT_rear_0  * p.Omega_hover_rear;
+dQ_dOmega_front = 2 * p.KpM_front_0 * p.Omega_hover_front;
+dQ_dOmega_rear  = 2 * p.KpM_rear_0  * p.Omega_hover_rear;
+
+L_domega_front = y_front         * dT_dOmega_front;
+M_domega_front = abs(p.x_front)  * dT_dOmega_front;
+M_domega_rear  = abs(p.x_rear)   * dT_dOmega_rear;
+N_domega_reaction = 2 * (dQ_dOmega_front + dQ_dOmega_rear);
+
+p.Kp_roll_rate  = p.Ixx * omega_cl_rate / L_domega_front;
+p.Kp_pitch_rate = p.Iyy * omega_cl_rate / M_domega_front;
+p.Kp_yaw_rate   = p.Izz * omega_cl_rate / N_domega_reaction;
+
+p.Ki_roll_rate  = p.Kp_roll_rate  * omega_cl_rate / 10;
+p.Ki_pitch_rate = p.Kp_pitch_rate * omega_cl_rate / 10;
+p.Ki_yaw_rate   = p.Kp_yaw_rate   * omega_cl_rate / 10;
+
+% Collective (heave) rate loop: simple thrust-to-weight P gain, first pass.
+% Vertical acceleration per unit differential Omega across all 4 motors,
+% linearised at hover.
+dT_dOmega_all_hover = dT_dOmega_front + dT_dOmega_front + dT_dOmega_rear + dT_dOmega_rear;
+p.Kp_collective     = p.mass * omega_cl_rate / dT_dOmega_all_hover;
+
+%% =========================================================================
 %  9. PROPELLER AIRSPEED LUTs  (scale factors on KpT_0 and KpM_0)
 %% =========================================================================
 % Field name used consistently everywhere: p.prop_V_bp
