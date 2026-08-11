@@ -1,23 +1,44 @@
 %% =========================================================================
 %  DYULON SYSTEMS - Hybrid VTOL Plant Model Initialization
-%  dyulon_init.m   |   Rev 3 - fully expression-driven
+%  dyulon_init.m   |   Rev 4 - independently-tilting rear motors + control allocation
 %
 %  DESIGN INTENT:
 %  Every derived parameter is computed from primary inputs using explicit
 %  expressions. Change a primary input at the top and re-run - all
 %  dependent values update automatically.
 %
+%  REV 4 CHANGES:
+%    - Rear motors now tilt (previously fixed). New local convention:
+%        beta_rear = 0   -> straight DOWN  (pusher prop)
+%        beta_rear = -90 -> forward         (same physical direction as front -90)
+%        range: [-100, -20] deg  (never reaches pure-down or pure-forward-only)
+%      Front motors UNCHANGED:
+%        beta_front = 0   -> straight UP   (tractor prop)
+%        beta_front = -90 -> forward
+%        range: [-100, +5] deg
+%      Both motors use the IDENTICAL thrust vector formula. No sign flip
+%      needed - the only difference is each motor's own mechanical zero.
+%    - Added PID (not just P/PD) structure for all three control loops.
+%    - Added per-flight-stage tilt perturbation limits and DOF weighting
+%      for control allocation (motor speed vs tilt angle).
+%    - Added AoA/stall saturation parameters.
+%
 %  PRIMARY INPUTS (the only numbers you should ever change directly):
 %    p.mass, p.V_cruise_kmh, p.V_stall_target, p.AR, p.CL_max_assumed,
 %    p.TW_ratio, p.frac_front, p.D_front_in, p.D_rear_in,
 %    p.Ct_front, p.Cm_front, p.Ct_rear, p.Cm_rear,
-%    p.k_Ixx, p.k_Iyy, sensor noise values, actuator dynamics values.
+%    p.k_Ixx, p.k_Iyy, sensor noise values, actuator dynamics values,
+%    p.gains.*, p.tilt_limits.*, p.alloc_weights.*
 %
 %  HOW TO USE:
 %    Run dyulon_init.m, then dyulon_plot_luts.m to sanity check.
 %    All Simulink blocks read from the 'p' workspace struct.
 %  =========================================================================
 clear; clc;
+
+
+%Assume a wing ratio and derive the stall speed (could result to worse
+%performance)
 
 %% =========================================================================
 %  0. PRIMARY DESIGN INPUTS  ← only edit numbers in this section
@@ -113,16 +134,80 @@ p.r_motor = [ p.x_front, -y_front,  p.z_motor;   % 1: Front-Left
 
 p.spin_dir   = [-1, 1, 1, -1];   % CW/CCW from above, counter-rotating pairs
 p.motor_type = [ 1, 1, 2,  2];   % 1=hover prop  2=cruise prop
-p.has_tilt   = [ 1, 1, 0,  0];   % front tilt, rear fixed
-
-p.beta_rear_fixed = deg2rad(0);   % rear motors vertical (no lean)
+p.has_tilt   = [ 1, 1, 1,  1];   % REV4: all four motors now tilt
 
 %% =========================================================================
 %  6. TILT SERVO  (primary inputs; dynamics from Mancinelli bench data)
+%
+%  REV 4 SIGN CONVENTION (confirmed, do not re-derive):
+%    Both front and rear motors use the IDENTICAL thrust vector formula:
+%        T_vec_i = T_i * [-sin(beta_i); 0; -cos(beta_i)]
+%    The only difference between motor types is where beta=0 physically
+%    points, because the rear motors are pusher props mounted backwards
+%    relative to the front tractor props:
+%
+%      FRONT (tractor):  beta_front = 0   -> straight UP
+%                         beta_front = -90 -> forward
+%                         range: [-100, +5] deg   (mostly negative = useful)
+%
+%      REAR (pusher):    beta_rear  = 0   -> straight DOWN
+%                         beta_rear  = -90 -> forward (same physical direction
+%                                              as front's -90, both converge
+%                                              to pure forward thrust here)
+%                         range: [-100, -20] deg  (never reaches pure-down
+%                                              or pure-forward-only; always
+%                                              retains a vertical+forward mix)
+%
+%    Hover/takeoff/landing trim sits near the negative limit for rear
+%    (close to -100 deg, i.e. close to forward-pointing but with a strong
+%    downward component still present) and near 0 deg for front (near
+%    straight-up). This gives both motor groups a net-forward thrust
+%    component even in hover, by design.
 %% =========================================================================
-p.beta_min       = deg2rad(-100);  % rad  hard stop
-p.beta_max       = deg2rad(5);     % rad  hard stop
-p.servo_omega_n  = 55;             % rad/s
+
+% --- Front motor tilt limits (tractor, zero = up) ---
+p.beta_front_min  = deg2rad(-100);  % rad  hard stop (near-forward)
+p.beta_front_max  = deg2rad(5);     % rad  hard stop (just past vertical)
+p.beta_front_rest = deg2rad(0);     % rad  hover/takeoff/landing trim (straight up)
+
+% --- Rear motor tilt limits (pusher, zero = down) ---
+%
+%  Range [-100, -20] deg:
+%    -20 deg = hover/takeoff/landing trim
+%              -> 94% upward (lift) + 34% forward. Rear motors contribute
+%                 meaningfully to hover lift while retaining a forward bias.
+%    -90 deg = pure forward thrust (cruise target)
+%    -100 deg = negative hard stop, gives ±10 deg perturbation room around
+%               -90 in cruise without crossing into net-downward territory
+%               (anything past -90 pushes vehicle slightly down).
+%
+%  Blend schedule drives beta_rear from rest (-20) to cruise (-90):
+%    beta_rear_cmd = beta_rear_rest + (-pi/2 - beta_rear_rest) * blend
+%                  = -20 + (-90 - (-20)) * blend  [deg]
+%                  = -20 - 70 * blend
+p.beta_rear_min   = deg2rad(-100);  % rad  hard stop (10 deg past forward, perturbation limit)
+p.beta_rear_max   = deg2rad(-20);   % rad  hard stop (hover trim, mostly-up with fwd bias)
+p.beta_rear_rest  = deg2rad(-20);   % rad  hover/takeoff/landing trim
+
+% Legacy combined fields (kept for any code still expecting beta_min/beta_max
+% as a single front-oriented range; front values used since front is the
+% historically "primary" tilting surface)
+p.beta_min = p.beta_front_min;
+p.beta_max = p.beta_front_max;
+
+% Per-motor min/max/rest, indexed [FL, FR, RL, RR] - used directly by
+% the control allocation / saturation logic so nothing needs an if-statement
+% on motor index inside the controller blocks.
+% Per-motor arrays indexed [FL, FR, RL, RR]
+% Note: beta_rear_max = -20 deg (least negative = closest to hover trim = upper bound)
+%       beta_rear_min = -100 deg (most negative = closest to forward/past = lower bound)
+%       This is numerically correct: min < max, i.e. -100 < -20. Saturation
+%       clamp in the controller uses these directly: max(min(beta, max), min).
+p.beta_motor_min  = [p.beta_front_min,  p.beta_front_min,  p.beta_rear_min,  p.beta_rear_min];
+p.beta_motor_max  = [p.beta_front_max,  p.beta_front_max,  p.beta_rear_max,  p.beta_rear_max];
+p.beta_motor_rest = [p.beta_front_rest, p.beta_front_rest, p.beta_rear_rest, p.beta_rear_rest];
+
+p.servo_omega_n  = 55;             % rad/s WHAT IS THIS
 p.servo_zeta     = 1.5;            % overdamped
 p.servo_rate_lim = 11.0;           % rad/s  max tilt rate
 
@@ -132,8 +217,8 @@ p.servo_rate_lim = 11.0;           % rad/s  max tilt rate
 D_front = p.D_front_in * 0.0254;   % m  convert inches to metres
 D_rear  = p.D_rear_in  * 0.0254;   % m
 
-% KpT = Ct * rho * D^4 / (4*pi²)    [N / (rad/s)²]
-% KpM = Cm * rho * D^5 / (4*pi²)    [N·m / (rad/s)²]
+% KpT = Ct * rho * D^4 / (4*pi²)    [N / (rad/s)²]    %WHAT IS THIS
+% KpM = Cm * rho * D^5 / (4*pi²)    [N·m / (rad/s)²]  % WHAT IS THIS
 p.KpT_front_0 = p.Ct_front * p.rho * D_front^4 / (4*pi^2);
 p.KpM_front_0 = p.Cm_front * p.rho * D_front^5 / (4*pi^2);
 p.KpT_rear_0  = p.Ct_rear  * p.rho * D_rear^4  / (4*pi^2);
@@ -151,6 +236,9 @@ p.Omega_hover_front = sqrt(T_front_each / p.KpT_front_0);  % rad/s
 p.Omega_hover_rear  = sqrt(T_rear_each  / p.KpT_rear_0);   % rad/s
 
 % Max speed: 1.5× hover → 35% headroom for attitude control perturbations
+%SAFETY FACTOR -> 50%
+
+
 p.Omega_max_front = 1.5 * p.Omega_hover_front;
 p.Omega_max_rear  = 1.5 * p.Omega_hover_rear;
 
@@ -163,18 +251,9 @@ p.motor_bandwidth = 25;   % rad/s  first-order motor model corner frequency
 %% =========================================================================
 %  9. PROPELLER AIRSPEED LUTs  (scale factors on KpT_0 and KpM_0)
 %% =========================================================================
-% Field name used consistently everywhere: p.prop_V_bp
-% Front props lose thrust faster with airspeed (large hover-optimised diameter)
-% Rear props retain thrust better (smaller cruise-optimised diameter)
-%
-% Linear decrease approx: scale ≈ 1 - k_v * V
-%   Front: k_v ≈ 0.022 (matches ~30% retention at 35 m/s)
-%   Rear:  k_v ≈ 0.013 (matches ~55% retention at 35 m/s)
-% Breakpoints cover 0 to cruise + 10%:
-
 p.prop_V_bp = [0,    5,    10,   15,   20,   25,   35  ];  % m/s
 
-p.KpT_front_scale = [1.00, 0.89, 0.78, 0.67, 0.56, 0.46, 0.30];
+p.KpT_front_scale = [1.00, 0.89, 0.78, 0.67, 0.56, 0.46, 0.30]; % HOW ARE THESE DERIVED
 p.KpT_rear_scale  = [1.00, 0.94, 0.88, 0.82, 0.75, 0.68, 0.55];
 p.KpM_front_scale = p.KpT_front_scale;
 p.KpM_rear_scale  = p.KpT_rear_scale;
@@ -182,9 +261,6 @@ p.KpM_rear_scale  = p.KpT_rear_scale;
 %% =========================================================================
 %  10. WING AERODYNAMICS LUTs
 %% =========================================================================
-% Reflex airfoil class (TL54 / MH60 / AG35).  Re ≈ 500k-1M.
-% Replace with XFLR5 output for chosen airfoil.
-
 p.aero_alpha_deg = [-8,  -6,  -4,  -2,   0,   2,   4,   6,   8,  10,  12,  14,  16,  18];
 
 p.aero_CL = [-0.61,-0.40,-0.19, 0.00, 0.20, 0.40, 0.59, 0.76, 0.90, 1.01, 1.07, 1.00, 0.80, 0.55];
@@ -202,19 +278,20 @@ p.Cm_q = -8.0;    % pitch rate damping
 p.Cl_p = -0.45;   % roll  rate damping
 p.Cn_r = -0.12;   % yaw   rate damping
 p.Cl_b = -0.08;   % dihedral effect
-p.Cn_b =  0.005;  % weathercock (weak - no vertical fin)
+p.Cn_b =  0.005;  % weathercock (weak - no vertical fin)  #WHAT IS THIS
 
 %% =========================================================================
 %  11. TRANSITION BLEND SCHEDULE  (derived from stall speed)
 %% =========================================================================
-% Blend starts when wing contributes meaningfully (roughly q*S*CL ≈ 15-20% W)
-% Blend ends at 10% above stall to leave motor backup margin
 p.V_blend_lo = 10.0;                         % m/s  (fixed: wing starts ~18% lift here)
 p.V_blend_hi = p.V_stall_target * 1.10;      % m/s  derived: 10% above target stall
 
 %% =========================================================================
 %  12. SENSOR NOISE AND DELAYS
 %% =========================================================================
+
+%ALL ASSUMED VALUES
+
 p.noise.pos_xy     = 0.50;           % m
 p.noise.pos_z      = 0.80;           % m
 p.noise.vel        = 0.10;           % m/s
@@ -236,7 +313,7 @@ p.delay.rpm   = 0.003;  % s
 %% =========================================================================
 %  13. DERIVED AERODYNAMIC QUANTITIES
 %% =========================================================================
-CLCD_vec             = p.aero_CL ./ p.aero_CD;
+CLCD_vec             = p.aero_CL ./ p.aero_CD; %CHANGE THIS TO HAVE MORE POINTS (SO interpolate Cl and Cd to have more points and get more points for CLCD  
 [~, idx_bestLD]      = max(CLCD_vec);
 p.alpha_bestLD_deg   = p.aero_alpha_deg(idx_bestLD);
 p.CL_bestLD          = p.aero_CL(idx_bestLD);
@@ -249,11 +326,137 @@ p.alpha_stall_deg     = p.aero_alpha_deg(idx_stall);
 p.V_stall_actual = sqrt(2 * p.W / (p.rho * p.S * p.CL_max));
 p.CL_at_cruise   = p.W / (0.5 * p.rho * p.V_cruise^2 * p.S);
 
+% Stall AoA protection band - used by inner loop to saturate theta_ref
+p.alpha_protect_lo_deg = 2.0;                  % deg  lower AoA bound (avoid negative stall)
+p.alpha_protect_hi_deg = p.alpha_stall_deg - 2; % deg  stay 2 deg below stall AoA as margin
+
 %% =========================================================================
-%  14. SUMMARY PRINT
+%  14. FLIGHT STAGE DEFINITION  (purely airspeed-based, single source of truth)
+%
+%  Three stages, driven entirely by the existing blend factor computed from
+%  V_air. No separate tilt-based staging - tilt commands and limits are an
+%  OUTPUT of the stage/blend, never an input that defines it. This avoids
+%  any possibility of airspeed and tilt position disagreeing about what
+%  stage the vehicle is in.
+%
+%    STAGE 1 - HOVER/TAKEOFF/LANDING : blend = 0           (V < V_blend_lo)
+%    STAGE 2 - TRANSITION            : 0 < blend < 1        (V_blend_lo..V_blend_hi)
+%    STAGE 3 - CRUISE                : blend = 1            (V > V_blend_hi)
+%
+%  Takeoff, hover, and landing are modelled as the same stage for now
+%  (per project decision) - all share blend = 0 behaviour and limits.
+%% =========================================================================
+p.stage.HOVER      = 1;   % hover / takeoff / landing combined
+p.stage.TRANSITION = 2;
+p.stage.CRUISE     = 3;
+
+%% =========================================================================
+%  15. PER-STAGE TILT PERTURBATION LIMITS
+%
+%  These are ADDITIONAL perturbation allowances on top of each motor's
+%  rest/trim position (p.beta_motor_rest), used by the control allocation
+%  logic to decide how far it may move beta away from trim for attitude
+%  correction at a given blend value. Independent from the hard mechanical
+%  stops in Section 6 - perturbation limits are always tighter than or
+%  equal to the hard stops, and are interpolated continuously vs blend
+%  using the breakpoints below (so behaviour matches the continuous
+%  blending philosophy even though limits are specified "per stage").
+%
+%  Rationale (per project decision):
+%   - Hover/takeoff: REAR motors get LARGE perturbation freedom (they
+%     contribute little to lift here, so swinging them doesn't risk
+%     losing vertical thrust). FRONT motors get a SMALL perturbation -
+%     they are the primary lift contributors in hover and must stay
+%     close to their vertical trim.
+%   - Cruise: FRONT motors get a LARGER (but still partial) perturbation
+%     allowance since they become the secondary/pitch-trim actuator.
+%     REAR motors get a SMALL perturbation - they are the primary thrust
+%     contributors in cruise and must not be disturbed much.
+%   - Transition: linear interpolation between the two endpoints, same
+%     breakpoints as the existing V_blend_lo/V_blend_hi schedule.
+%% =========================================================================
+
+% Breakpoints reuse the existing transition schedule exactly (single
+% source of truth - no separate stage breakpoints to keep in sync)
+p.tilt_limits.V_bp = [p.V_blend_lo, p.V_blend_hi];   % m/s, [hover_end, cruise_start]
+
+% Front motor perturbation allowance (deg off trim), at [hover, cruise]
+p.tilt_limits.front_perturb_deg_bp = [2, 10];
+
+% Rear motor perturbation allowance (deg off trim), at [hover, cruise]
+p.tilt_limits.rear_perturb_deg_bp  = [8, 2];
+
+% Convenience pre-converted radian versions (interp1 at runtime still uses
+% the _deg_bp arrays directly against p.tilt_limits.V_bp; these are for
+% any block that wants the hover/cruise endpoints directly without an
+% interp1 call)
+p.tilt_limits.front_perturb_rad_bp = deg2rad(p.tilt_limits.front_perturb_deg_bp);
+p.tilt_limits.rear_perturb_rad_bp  = deg2rad(p.tilt_limits.rear_perturb_deg_bp);
+
+%% =========================================================================
+%  16. CONTROL ALLOCATION DOF WEIGHTING (speed vs tilt split)
+%
+%  When a correction (e.g. extra lift demand under AoA saturation) can be
+%  met by EITHER increasing motor speed (Omega) OR adjusting tilt (beta),
+%  this weight decides how much of the correction goes to each DOF.
+%  Currently flat 50/50 across all motors and stages - project owner to
+%  revisit and tune per-stage/per-motor weighting later.
+%% =========================================================================
+p.alloc_weights.omega_share = 0.5;   % fraction of correction via motor speed
+p.alloc_weights.tilt_share  = 0.5;   % fraction of correction via tilt angle
+assert(abs(p.alloc_weights.omega_share + p.alloc_weights.tilt_share - 1.0) < 1e-9, ...
+       'omega_share + tilt_share must equal 1.0');
+
+%% =========================================================================
+%  17. PID GAINS - ALL THREE LOOPS
+%
+%  Full PID structure provided for every loop. Any gain can be set to 0
+%  to recover P/PD/PI behaviour without changing block structure.
+%  Attitude loops use direct rate feedback for the derivative term
+%  (Kd * rate_measured) rather than differentiating the angle error, to
+%  avoid derivative noise and to keep gains directly portable to
+%  ArduPilot's rate-feedback architecture.
+%% =========================================================================
+
+% --- Outer loop: position error -> velocity reference ---
+p.gains.outer.Kp_xy = 0.5;    % 1/s
+p.gains.outer.Ki_xy = 0.0;    % 1/s² (start at 0 - position integrator risks windup
+                               %       through transition; raise only if steady-state
+                               %       position error is observed in sim)
+p.gains.outer.Kp_z  = 0.6;    % 1/s
+p.gains.outer.Ki_z  = 0.0;    % 1/s²
+
+% --- Mid loop: velocity error -> acceleration reference ---
+p.gains.mid.Kp_xy = 1.0;      % (m/s²)/(m/s)
+p.gains.mid.Ki_xy = 0.15;     % (m/s²)/(m/s)/s
+p.gains.mid.Kp_z  = 1.5;      % (m/s²)/(m/s)
+p.gains.mid.Ki_z  = 0.20;     % (m/s²)/(m/s)/s
+
+% --- Inner loop: attitude ---
+p.gains.inner.Kp_theta = 8.0;    % (rad/s²)/rad
+p.gains.inner.Ki_theta = 0.5;    % (rad/s²)/rad/s
+p.gains.inner.Kd_theta = 3.0;    % (rad/s²)/(rad/s)   - multiplies q_rate directly
+
+p.gains.inner.Kp_phi   = 6.0;    % (rad/s²)/rad
+p.gains.inner.Ki_phi   = 0.5;    % (rad/s²)/rad/s
+p.gains.inner.Kd_phi   = 2.5;    % (rad/s²)/(rad/s)   - multiplies p_rate directly
+
+p.gains.inner.Kp_psi   = 3.0;    % (rad/s)/rad
+p.gains.inner.Ki_psi   = 0.1;    % (rad/s)/rad/s
+p.gains.inner.Kd_psi   = 0.0;    % (rad/s)/(rad/s)    - yaw authority weak, Kd off by default
+
+% Integrator anti-windup limits (symmetric, applied in Simulink at the
+% Discrete Integrator block level via the "Limit output" setting - listed
+% here so the value lives in one place)
+p.gains.windup_limit_outer = 5.0;     % m/s   (velocity reference clamp from outer I-term)
+p.gains.windup_limit_mid   = 5.0;     % m/s²  (accel reference clamp from mid I-term)
+p.gains.windup_limit_inner = deg2rad(15);  % rad/s (rate command clamp from inner I-term)
+
+%% =========================================================================
+%  18. SUMMARY PRINT
 %% =========================================================================
 fprintf('\n=============================================\n');
-fprintf(' DYULON SYSTEMS - Model Initialised (Rev 3)\n');
+fprintf(' DYULON SYSTEMS - Model Initialised (Rev 4)\n');
 fprintf('=============================================\n');
 fprintf('Mass:                  %.1f kg\n',   p.mass);
 fprintf('Weight:                %.2f N\n',    p.W);
@@ -267,6 +470,7 @@ fprintf('Cruise speed:          %.3f m/s  (%.1f km/h)\n', p.V_cruise, p.V_cruise
 fprintf('CL at cruise:          %.4f\n',     p.CL_at_cruise);
 fprintf('Cruise / stall margin: %.2fx\n',    p.V_cruise / p.V_stall_actual);
 fprintf('Best L/D:              %.1f  at %.1f deg AoA\n', p.CLCD_max, p.alpha_bestLD_deg);
+fprintf('AoA protect band:      [%.1f, %.1f] deg\n', p.alpha_protect_lo_deg, p.alpha_protect_hi_deg);
 fprintf('\n--- Inertia ---\n');
 fprintf('Ixx (roll):            %.3f kg·m²\n', p.Ixx);
 fprintf('Iyy (pitch):           %.3f kg·m²\n', p.Iyy);
@@ -284,6 +488,15 @@ fprintf('Rear:  %.1f N each  @  %.0f rad/s  (%.0f RPM)\n', ...
         T_rear_check,  p.Omega_hover_rear,  p.Omega_hover_rear*60/(2*pi));
 fprintf('Total: %.1f N  |  Weight: %.1f N  |  T/W: %.3f\n', ...
         T_total_check, p.W, T_total_check/p.W);
+fprintf('\n--- Tilt Convention (Rev 4) ---\n');
+fprintf('Front (tractor, 0=up):    rest=%.1f deg  range=[%.1f, %.1f] deg\n', ...
+        rad2deg(p.beta_front_rest), rad2deg(p.beta_front_min), rad2deg(p.beta_front_max));
+fprintf('Rear  (pusher, 0=down):   rest=%.1f deg  range=[%.1f, %.1f] deg\n', ...
+        rad2deg(p.beta_rear_rest), rad2deg(p.beta_rear_min), rad2deg(p.beta_rear_max));
+fprintf('Front perturb (hover->cruise): %.1f -> %.1f deg\n', ...
+        p.tilt_limits.front_perturb_deg_bp(1), p.tilt_limits.front_perturb_deg_bp(2));
+fprintf('Rear  perturb (hover->cruise): %.1f -> %.1f deg\n', ...
+        p.tilt_limits.rear_perturb_deg_bp(1), p.tilt_limits.rear_perturb_deg_bp(2));
 fprintf('\n--- Transition ---\n');
 fprintf('Blend lo:              %.1f m/s\n', p.V_blend_lo);
 fprintf('Blend hi:              %.1f m/s  (%.0f%% above stall)\n', ...
@@ -295,9 +508,8 @@ fprintf('Rear:  x=%.2f m, y=±%.3f m  (%.0f%% semi-span)\n', ...
         p.x_rear,  abs(p.r_motor(3,2)), p.y_rear_frac*100);
 fprintf('=============================================\n\n');
 
-
 %% =========================================================================
-%  15. STATE VECTOR DEFINITION
+%  19. STATE VECTOR DEFINITION
 %  Order here must match the Mux block in Simulink exactly.
 %  This vector serves two purposes:
 %    (a) defines the interface contract between all blocks
@@ -320,35 +532,46 @@ ic.pos_D          = -10;     % 10 m altitude, NED so negative
 ic.vel_N          = 0;
 ic.vel_E          = 0;
 ic.vel_D          = 0;
-ic.beta_tilt_FL   = 0;
-ic.beta_tilt_FR   = 0;
+
+% REV4: all four motors have tilt feedback now (was only front)
+ic.beta_tilt_FL   = p.beta_front_rest;
+ic.beta_tilt_FR   = p.beta_front_rest;
+ic.beta_tilt_RL   = p.beta_rear_rest;
+ic.beta_tilt_RR   = p.beta_rear_rest;
+
 ic.Omega_FL       = p.Omega_hover_front;
 ic.Omega_FR       = p.Omega_hover_front;
 ic.Omega_RL       = p.Omega_hover_rear;
 ic.Omega_RR       = p.Omega_hover_rear;
 
 % --- Pack into flat vector (order is the contract) ---
-%  [1]  V_air       m/s
-%  [2]  alpha       rad
-%  [3]  beta_side   rad
-%  [4]  p_rate      rad/s
-%  [5]  q_rate      rad/s
-%  [6]  r_rate      rad/s
-%  [7]  phi         rad
-%  [8]  theta       rad
-%  [9]  psi         rad
-%  [10] pos_N       m
-%  [11] pos_E       m
-%  [12] pos_D       m
-%  [13] vel_N       m/s
-%  [14] vel_E       m/s
-%  [15] vel_D       m/s
-%  [16] beta_tilt_FL rad
-%  [17] beta_tilt_FR rad
-%  [18] Omega_FL    rad/s
-%  [19] Omega_FR    rad/s
-%  [20] Omega_RL    rad/s
-%  [21] Omega_RR    rad/s
+%  [1]  V_air        m/s
+%  [2]  alpha        rad
+%  [3]  beta_side    rad
+%  [4]  p_rate       rad/s
+%  [5]  q_rate       rad/s
+%  [6]  r_rate       rad/s
+%  [7]  phi          rad
+%  [8]  theta        rad
+%  [9]  psi          rad
+%  [10] pos_N        m
+%  [11] pos_E        m
+%  [12] pos_D        m
+%  [13] vel_N        m/s
+%  [14] vel_E        m/s
+%  [15] vel_D        m/s
+%  [16] beta_tilt_FL rad   (REV4: front-left, was already present)
+%  [17] beta_tilt_FR rad   (REV4: front-right, was already present)
+%  [18] beta_tilt_RL rad   (REV4: NEW - rear-left now tilts)
+%  [19] beta_tilt_RR rad   (REV4: NEW - rear-right now tilts)
+%  [20] Omega_FL     rad/s (REV4: index shifted from 18 -> 20)
+%  [21] Omega_FR     rad/s (REV4: index shifted from 19 -> 21)
+%  [22] Omega_RL     rad/s (REV4: index shifted from 20 -> 22)
+%  [23] Omega_RR     rad/s (REV4: index shifted from 21 -> 23)
+%
+%  NOTE: vector length changed from 21 to 23 elements due to the two
+%  additional rear tilt feedback channels. Any existing Mux/Demux block
+%  in Simulink with hardcoded port counts must be updated to 23.
 
 p.state0_vec = [
     ic.V_air;
@@ -368,6 +591,8 @@ p.state0_vec = [
     ic.vel_D;
     ic.beta_tilt_FL;
     ic.beta_tilt_FR;
+    ic.beta_tilt_RL;
+    ic.beta_tilt_RR;
     ic.Omega_FL;
     ic.Omega_FR;
     ic.Omega_RL;
@@ -375,17 +600,24 @@ p.state0_vec = [
 ];
 
 % --- 6DOF block needs these separately ---
-% Position initial condition (NED)
 p.ic_pos    = [ic.pos_N; ic.pos_E; ic.pos_D];
-
-% Velocity initial condition (body frame for Euler block)
 p.ic_vel    = [ic.V_air; 0; 0];
-
-% Euler angle initial condition
 p.ic_euler  = [ic.phi; ic.theta; ic.psi];
-
-% Body rate initial condition
 p.ic_rates  = [ic.p_rate; ic.q_rate; ic.r_rate];
+
+%% =========================================================================
+%  20. REFERENCE / DESIRED STATE
+%% =========================================================================
+p.ref.pos_N   = 0;      % m
+p.ref.pos_E   = 0;      % m
+p.ref.pos_D   = -10;    % m   (10m altitude)
+p.ref.psi     = 0;      % rad (heading)
+p.ref.V_cmd   = 0;      % m/s (airspeed command, 0 = hover)
+
+% [1] pos_N  [2] pos_E  [3] pos_D  [4] psi_cmd  [5] V_cmd
+p.ref_vec = [p.ref.pos_N; p.ref.pos_E; p.ref.pos_D;
+             p.ref.psi;   p.ref.V_cmd];
 
 fprintf('State vector defined: %d elements\n', length(p.state0_vec));
 fprintf('Initial altitude: %.1f m\n', -ic.pos_D);
+fprintf('Rear motors now have independent tilt - state vector grew from 21 to 23 elements.\n\n');
